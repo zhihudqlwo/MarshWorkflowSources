@@ -1,0 +1,325 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+from __future__ import annotations
+
+from unittest import mock
+
+import pendulum
+import pytest
+from sqlalchemy import delete, select
+
+from airflow.models import DagRun, TaskInstance
+from airflow.models.xcom import XComModel
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.python import BranchPythonOperator
+from airflow.sdk import task, task_group
+from airflow.sdk.bases.xcom import BaseXCom
+from airflow.ti_deps.dep_context import DepContext
+from airflow.ti_deps.deps.not_previously_skipped_dep import (
+    XCOM_SKIPMIXIN_FOLLOWED,
+    XCOM_SKIPMIXIN_KEY,
+    XCOM_SKIPMIXIN_SKIPPED,
+    NotPreviouslySkippedDep,
+)
+from airflow.utils.state import State
+from airflow.utils.types import DagRunType
+
+from tests_common.test_utils.taskinstance import run_task_instance
+
+pytestmark = pytest.mark.db_test
+
+
+@pytest.fixture(autouse=True)
+def clean_db(session):
+    yield
+    session.execute(delete(DagRun))
+    session.execute(delete(TaskInstance))
+
+
+def test_no_parent(session, dag_maker):
+    """
+    A simple DAG with a single task. NotPreviouslySkippedDep is met.
+    """
+    start_date = pendulum.datetime(2020, 1, 1)
+    with dag_maker(
+        "test_test_no_parent_dag",
+        schedule=None,
+        start_date=start_date,
+        session=session,
+    ):
+        EmptyOperator(task_id="op1")
+
+    (ti1,) = dag_maker.create_dagrun(logical_date=start_date).task_instances
+
+    dep = NotPreviouslySkippedDep()
+    assert len(list(dep.get_dep_statuses(ti1, DepContext(), session=session))) == 0
+    assert dep.is_met(ti1, session=session)
+    assert ti1.state != State.SKIPPED
+
+
+def test_no_skipmixin_parent(session, dag_maker):
+    """
+    A simple DAG with no branching. Both op1 and op2 are EmptyOperator. NotPreviouslySkippedDep is met.
+    """
+    start_date = pendulum.datetime(2020, 1, 1)
+    with dag_maker(
+        "test_no_skipmixin_parent_dag",
+        schedule=None,
+        start_date=start_date,
+        session=session,
+    ):
+        op1 = EmptyOperator(task_id="op1")
+        op2 = EmptyOperator(task_id="op2")
+        op1 >> op2
+
+    _, ti2 = dag_maker.create_dagrun().task_instances
+
+    dep = NotPreviouslySkippedDep()
+    assert len(list(dep.get_dep_statuses(ti2, DepContext(), session=session))) == 0
+    assert dep.is_met(ti2, session=session)
+    assert ti2.state != State.SKIPPED
+
+
+def test_parent_follow_branch(session, dag_maker):
+    """
+    A simple DAG with a BranchPythonOperator that follows op2. NotPreviouslySkippedDep is met.
+    """
+    start_date = pendulum.datetime(2020, 1, 1)
+    with dag_maker(
+        "test_parent_follow_branch_dag",
+        schedule=None,
+        start_date=start_date,
+        session=session,
+    ):
+        op1 = BranchPythonOperator(task_id="op1", python_callable=lambda: "op2")
+        op2 = EmptyOperator(task_id="op2")
+        op1 >> op2
+
+    dagrun = dag_maker.create_dagrun(run_type=DagRunType.MANUAL, state=State.RUNNING)
+    ti, ti2 = dagrun.task_instances
+    run_task_instance(ti, op1)
+
+    dep = NotPreviouslySkippedDep()
+    assert len(list(dep.get_dep_statuses(ti2, DepContext(), session=session))) == 0
+    assert dep.is_met(ti2, session=session)
+    assert ti2.state != State.SKIPPED
+
+
+def test_parent_skip_branch(session, dag_maker):
+    """
+    A simple DAG with a BranchPythonOperator that does not follow op2. NotPreviouslySkippedDep is not met.
+    """
+    start_date = pendulum.datetime(2020, 1, 1)
+    with dag_maker(
+        "test_parent_skip_branch_dag",
+        schedule=None,
+        start_date=start_date,
+        session=session,
+    ):
+        op1 = BranchPythonOperator(task_id="op1", python_callable=lambda: "op3")
+        op2 = EmptyOperator(task_id="op2")
+        op3 = EmptyOperator(task_id="op3")
+        op1 >> [op2, op3]
+
+    tis = {
+        ti.task_id: ti
+        for ti in dag_maker.create_dagrun(run_type=DagRunType.MANUAL, state=State.RUNNING).task_instances
+    }
+    run_task_instance(tis["op1"], op1)
+
+    dep = NotPreviouslySkippedDep()
+    assert len(list(dep.get_dep_statuses(tis["op2"], DepContext(), session=session))) == 1
+    assert not dep.is_met(tis["op2"], session=session)
+    assert tis["op2"].state == State.SKIPPED
+
+
+def test_parent_not_executed(session, dag_maker):
+    """
+    A simple DAG with a BranchPythonOperator that does not follow op2. Parent task is not yet
+    executed (no xcom data). NotPreviouslySkippedDep is met (no decision).
+    """
+    start_date = pendulum.datetime(2020, 1, 1)
+    with dag_maker(
+        "test_parent_not_executed_dag",
+        schedule=None,
+        start_date=start_date,
+        session=session,
+    ):
+        op1 = BranchPythonOperator(task_id="op1", python_callable=lambda: "op3")
+        op2 = EmptyOperator(task_id="op2")
+        op3 = EmptyOperator(task_id="op3")
+        op1 >> [op2, op3]
+
+    _, ti2, _ = dag_maker.create_dagrun().task_instances
+
+    dep = NotPreviouslySkippedDep()
+    assert len(list(dep.get_dep_statuses(ti2, DepContext(), session=session))) == 0
+    assert dep.is_met(ti2, session=session)
+    assert ti2.state == State.NONE
+
+
+def test_unmapped_parent_skip_mapped_downstream(session, dag_maker):
+    """
+    When an unmapped SkipMixin parent writes XCom with map_index=-1,
+    mapped downstream TIs (map_index >= 0) should still be skipped
+    by NotPreviouslySkippedDep.
+
+    Regression test for https://github.com/apache/airflow/issues/62118
+    """
+    start_date = pendulum.datetime(2020, 1, 1)
+    with dag_maker(
+        "test_unmapped_skip_mapped_dag",
+        schedule=None,
+        start_date=start_date,
+        session=session,
+    ):
+        op1 = BranchPythonOperator(task_id="op1", python_callable=lambda: "op3")
+        op2 = EmptyOperator(task_id="op2")
+        op3 = EmptyOperator(task_id="op3")
+        op1 >> [op2, op3]
+
+    dr = dag_maker.create_dagrun(run_type=DagRunType.MANUAL, state=State.RUNNING)
+    tis = {ti.task_id: ti for ti in dr.task_instances}
+
+    # Simulate the unmapped branch operator having run: set it to SUCCESS
+    # and store XCom with map_index=-1 (as SkipMixin does for unmapped tasks).
+    tis["op1"].state = State.SUCCESS
+    session.merge(tis["op1"])
+    XComModel.set(
+        key=XCOM_SKIPMIXIN_KEY,
+        value={XCOM_SKIPMIXIN_FOLLOWED: ["op3"]},
+        dag_id=dr.dag_id,
+        task_id="op1",
+        run_id=dr.run_id,
+        map_index=-1,
+        session=session,
+    )
+
+    # Simulate a mapped downstream TI by changing map_index to 0.
+    tis["op2"].map_index = 0
+    session.merge(tis["op2"])
+    session.flush()
+
+    dep = NotPreviouslySkippedDep()
+    assert len(list(dep.get_dep_statuses(tis["op2"], DepContext(), session=session))) == 1
+    assert not dep.is_met(tis["op2"], session=session)
+    assert tis["op2"].state == State.SKIPPED
+
+
+def test_parent_in_mapped_task_group_skips_same_map_index(session, dag_maker):
+    """
+    A SkipMixin parent inside a mapped task group writes XCom per map index, so
+    each child TI in the group must read the decision for its own map index.
+    """
+    with dag_maker("test_mapped_group_skip_dag", schedule=None, session=session):
+
+        @task.short_circuit(task_id="gate")
+        def gate(value):
+            return value
+
+        @task_group
+        def group(value):
+            gate(value) >> EmptyOperator(task_id="child")
+
+        group.expand(value=[True, False])
+
+    dr = dag_maker.create_dagrun(run_type=DagRunType.MANUAL, state=State.RUNNING)
+    tis = {(ti.task_id, ti.map_index): ti for ti in dr.task_instances}
+    for map_index in (0, 1):
+        tis[("group.gate", map_index)].state = State.SUCCESS
+        session.merge(tis[("group.gate", map_index)])
+    # Only the map index 1 gate short-circuited, as SkipMixin.skip records it.
+    XComModel.set(
+        key=XCOM_SKIPMIXIN_KEY,
+        value={XCOM_SKIPMIXIN_SKIPPED: ["group.child"]},
+        dag_id=dr.dag_id,
+        task_id="group.gate",
+        run_id=dr.run_id,
+        map_index=1,
+        session=session,
+    )
+    session.flush()
+
+    dep = NotPreviouslySkippedDep()
+
+    assert not dep.is_met(tis[("group.child", 1)], session=session)
+    assert tis[("group.child", 1)].state == State.SKIPPED
+    assert dep.is_met(tis[("group.child", 0)], session=session)
+    assert tis[("group.child", 0)].state != State.SKIPPED
+
+
+def test_branch_skip_decision_bypasses_custom_xcom_backend(session, dag_maker):
+    """
+    A value-externalizing custom XCom backend must not break branch-skip of
+    mapped/cleared downstream tasks.
+
+    The branch decision is written through the real worker push path with such a
+    backend configured. It must be stored readably (not as the backend's opaque
+    pointer) so that NotPreviouslySkippedDep can skip a not-yet-expanded mapped
+    downstream task, which the worker does not skip directly.
+
+    Regression test for https://github.com/apache/airflow/issues/50491.
+    """
+
+    class _PointerXComBackend(BaseXCom):
+        @staticmethod
+        def serialize_value(value, **kwargs):
+            return "xcom_s3://pointer"
+
+        @staticmethod
+        def deserialize_value(result):
+            return "xcom_s3://pointer"
+
+    start_date = pendulum.datetime(2020, 1, 1)
+    with dag_maker(
+        "test_skip_bypass_backend_dag",
+        schedule=None,
+        start_date=start_date,
+        session=session,
+    ):
+        op1 = BranchPythonOperator(task_id="op1", python_callable=lambda: "op3")
+        op2 = EmptyOperator(task_id="op2")
+        op3 = EmptyOperator(task_id="op3")
+        op1 >> [op2, op3]
+
+    dr = dag_maker.create_dagrun(run_type=DagRunType.MANUAL, state=State.RUNNING)
+    tis = {ti.task_id: ti for ti in dr.task_instances}
+
+    with mock.patch("airflow.sdk.execution_time.task_runner.XCom", _PointerXComBackend):
+        run_task_instance(tis["op1"], op1)
+
+    stored = session.scalar(
+        select(XComModel.value).where(
+            XComModel.dag_id == dr.dag_id,
+            XComModel.task_id == "op1",
+            XComModel.run_id == dr.run_id,
+            XComModel.key == XCOM_SKIPMIXIN_KEY,
+            XComModel.map_index == -1,
+        )
+    )
+
+    assert stored is not None
+    assert "xcom_s3://pointer" not in str(stored)
+
+    tis["op2"].map_index = 0
+    session.merge(tis["op2"])
+    session.flush()
+
+    dep = NotPreviouslySkippedDep()
+    assert len(list(dep.get_dep_statuses(tis["op2"], DepContext(), session=session))) == 1
+    assert tis["op2"].state == State.SKIPPED

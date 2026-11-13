@@ -25,7 +25,7 @@ import os
 import textwrap
 import time
 from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest import mock
@@ -147,6 +147,7 @@ from airflow.sdk.execution_time.comms import (
     RetryTask,
     SetAssetStateStoreByName,
     SetAssetStateStoreByUri,
+    SetExecutionTimeout,
     SetRenderedFields,
     SetTaskStateStore,
     SetXCom,
@@ -440,7 +441,7 @@ def test_main_sends_reschedule_task_when_startup_reschedules(
     If startup raises AirflowRescheduleException, the task runner should report a RescheduleTask
     message to the supervisor and exit cleanly (code 0).
     """
-    ts = datetime(2025, 1, 1, tzinfo=dt_timezone.utc)
+    ts = datetime(2025, 1, 1, tzinfo=UTC)
     reschedule_date = ts + timedelta(seconds=60)
 
     mock_comms_instance = mock.Mock()
@@ -905,6 +906,79 @@ def test_parse_module_in_bundle_root(tmp_path: Path, make_ti_context):
         ti = parse(what, mock.Mock())
 
     assert ti.task.dag.dag_id == "dag_name"
+
+
+@pytest.mark.parametrize(
+    ("use_startup", "expected_dag_id", "expected_task_id"),
+    [
+        pytest.param(True, "expected_dag", "my_task", id="startup"),
+        pytest.param(False, None, None, id="parse"),
+    ],
+)
+@mock.patch("airflow.sdk.execution_time.task_runner.get_listener_manager")
+@mock.patch("airflow.dag_processing.dagbag.BundleDagBag")
+@mock.patch("airflow.sdk.execution_time.bundles.DagBundlesManager")
+def test_bundle_initialize_parsing_context(
+    mock_manager_cls,
+    mock_bag_cls,
+    mock_listener_manager,
+    use_startup,
+    expected_dag_id,
+    expected_task_id,
+    make_ti_context,
+    tmp_path: Path,
+    monkeypatch,
+):
+    from airflow.sdk import get_parsing_context
+    from airflow.sdk.definitions.context import (
+        _AIRFLOW_PARSING_CONTEXT_DAG_ID,
+        _AIRFLOW_PARSING_CONTEXT_TASK_ID,
+    )
+
+    captured: dict[str, str | None] = {}
+    mock_bundle = mock.Mock()
+    mock_bundle.path = tmp_path
+
+    def capture_parsing_context():
+        ctx = get_parsing_context()
+        captured["dag_id"] = ctx.dag_id
+        captured["task_id"] = ctx.task_id
+
+    mock_bundle.initialize.side_effect = capture_parsing_context
+    mock_manager = mock_manager_cls.return_value
+    mock_manager.get_bundle.return_value = mock_bundle
+
+    with DAG("expected_dag") as dag:
+        BaseOperator(task_id="my_task")
+    mock_bag_cls.return_value.dags = {"expected_dag": dag}
+
+    what = StartupDetails(
+        ti=TaskInstance(
+            id=uuid7(),
+            task_id="my_task",
+            dag_id="expected_dag",
+            run_id="test_run",
+            try_number=1,
+            dag_version_id=uuid7(),
+            queue="default",
+        ),
+        dag_rel_path="dag.py",
+        bundle_info=BundleInfo(name="my-bundle", version=None),
+        ti_context=make_ti_context(),
+        start_date=timezone.utcnow(),
+        sentry_integration="",
+    )
+
+    monkeypatch.delenv(_AIRFLOW_PARSING_CONTEXT_DAG_ID, raising=False)
+    monkeypatch.delenv(_AIRFLOW_PARSING_CONTEXT_TASK_ID, raising=False)
+
+    if use_startup:
+        startup(what)
+    else:
+        parse(what, mock.Mock())
+
+    assert captured == {"dag_id": expected_dag_id, "task_id": expected_task_id}
+    mock_bundle.initialize.assert_called_once()
 
 
 class NativeDagImporter(CoordinatorDagImporter):
@@ -1756,7 +1830,7 @@ def test_run_task_timeout(time_machine, create_runtime_ti, mock_supervisor_comms
     mock_supervisor_comms.send.assert_called_with(TaskState(state=TaskInstanceState.FAILED, end_date=instant))
 
 
-def test_execution_timeout(create_runtime_ti):
+def test_execution_timeout(create_runtime_ti, mock_supervisor_comms):
     def sleep_and_catch_other_exceptions():
         with contextlib.suppress(Exception):
             # Catching Exception should NOT catch AirflowTaskTimeout
@@ -4111,7 +4185,7 @@ class TestRuntimeTaskInstance:
             relative_fileloc="dags/example.py",
             owners="owner_1",
             tags=["a_tag", "z_tag"],
-            next_dagrun=datetime(2026, 4, 13, tzinfo=dt_timezone.utc),
+            next_dagrun=datetime(2026, 4, 13, tzinfo=UTC),
         )
 
         response = RuntimeTaskInstance.get_dag(
@@ -6375,7 +6449,7 @@ class TestRunExecuteCallable:
         task.execution_timeout = execution_timeout
         return task
 
-    def test_runs_in_isolated_context_with_safeguard_tracker_set(self):
+    def test_runs_in_isolated_context_with_safeguard_tracker_set(self, mock_supervisor_comms):
         """The callable runs in an internal context copy that has the safeguard tracker set and does not leak."""
         var = contextvars.ContextVar("marker")
         var.set("outer")
@@ -6397,8 +6471,9 @@ class TestRunExecuteCallable:
         # The .set was confined to the copy, so the tracker never leaked to the caller's context.
         assert ExecutorSafeguard.tracker.get(None) is not task
         task.on_kill.assert_not_called()
+        mock_supervisor_comms.send.assert_not_called()
 
-    def test_applies_execution_timeout(self):
+    def test_applies_execution_timeout(self, mock_supervisor_comms):
         """When a timeout is set and the callable overruns, AirflowTaskTimeout is raised and on_kill is called."""
         task = self._make_task(execution_timeout=timedelta(milliseconds=10))
 
@@ -6409,8 +6484,9 @@ class TestRunExecuteCallable:
             _run_execute_callable(context={}, execute=execute, task=task)
 
         task.on_kill.assert_called_once()
+        mock_supervisor_comms.send.assert_called_once_with(SetExecutionTimeout(timeout_seconds=0.01))
 
-    def test_fast_fails_when_timeout_already_elapsed(self):
+    def test_fast_fails_when_timeout_already_elapsed(self, mock_supervisor_comms):
         """A non-positive timeout fast-fails before running the callable and still calls on_kill."""
         task = self._make_task(execution_timeout=timedelta(seconds=-1))
         execute = mock.MagicMock()
@@ -6420,6 +6496,7 @@ class TestRunExecuteCallable:
 
         execute.assert_not_called()
         task.on_kill.assert_called_once()
+        mock_supervisor_comms.send.assert_not_called()
 
     def test_emits_task_execute_span_at_detail_level_2(self):
         """At detail level 2, running the callable produces a recorded ``task.execute`` span."""
@@ -6521,7 +6598,7 @@ class TestTaskInstanceStateOperations:
 
         task = MyOperator(task_id="t")
         runtime_ti = create_runtime_ti(task=task)
-        frozen_dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt_timezone.utc)
+        frozen_dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         time_machine.move_to(frozen_dt, tick=False)
 
         with conf_vars({("state_store", "default_retention_days"): "30"}):
@@ -6565,7 +6642,7 @@ class TestTaskInstanceStateOperations:
                 ts.set("poll_result", {"status": "succeeded", "rows": 1234})
                 ts.set("checkpoints", [1, 2, 3])
 
-        frozen_dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt_timezone.utc)
+        frozen_dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         time_machine.move_to(frozen_dt, tick=False)
         task = MyOperator(task_id="t")
         runtime_ti = create_runtime_ti(task=task)
@@ -6596,7 +6673,7 @@ class TestTaskInstanceStateOperations:
 
         task = MyOperator(task_id="t")
         runtime_ti = create_runtime_ti(task=task)
-        frozen_dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt_timezone.utc)
+        frozen_dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         time_machine.move_to(frozen_dt, tick=False)
 
         run(runtime_ti, context=runtime_ti.get_template_context(), log=mock.MagicMock())
@@ -6864,7 +6941,7 @@ class TestTaskInstanceStateOperations:
             def execute(self, context):
                 context["task_state_store"].set("job_id", "app_001")
 
-        frozen_dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=dt_timezone.utc)
+        frozen_dt = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
         time_machine.move_to(frozen_dt, tick=False)
         task = MyOperator(task_id="t")
         runtime_ti = create_runtime_ti(task=task)
@@ -6984,7 +7061,6 @@ class TestRegisterDeserializationAllowedClasses:
     """
 
     def test_registers_real_and_mapped_operators(self):
-
         with DAG("walker_dag") as dag:
             # Non-mapped producer: output_type is a plain attribute.
             _WalkerOperator(task_id="real", output_type=_WalkerModelA)
@@ -7000,7 +7076,6 @@ class TestRegisterDeserializationAllowedClasses:
         assert _WalkerModelB in registered, "mapped operator output_type not registered"
 
     def test_default_operator_registers_nothing(self):
-
         with DAG("walker_dag_plain") as dag:
             BaseOperator(task_id="plain")
 

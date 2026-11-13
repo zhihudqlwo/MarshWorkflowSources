@@ -323,7 +323,6 @@ The workflow-orchestration source mirror includes its original Python source tre
 - [ ] **task-sdk/src/airflow/sdk/execution_time/task_runner.py:1055** - # TODO: Task-SDK:
 - [ ] **task-sdk/src/airflow/sdk/execution_time/task_runner.py:1444** - # TODO: Call pre execute etc.
 - [ ] **task-sdk/src/airflow/sdk/execution_time/task_runner.py:2207** - # TODO: handle timeout in case of deferral
-- [ ] **task-sdk/tests/task_sdk/definitions/test_mappedoperator.py:74** - # TODO:
 
 ## License
 
